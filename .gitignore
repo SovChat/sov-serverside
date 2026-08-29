@@ -1,0 +1,5 @@
+# 运行时数据目录
+data/
+# 编译产物
+groupchat-server
+*.test
