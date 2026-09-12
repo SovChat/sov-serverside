@@ -33,6 +33,21 @@ func loggingMiddleware(next http.Handler) http.Handler {
 	})
 }
 
+// corsMiddleware 开发期 CORS 支持：允许任意来源跨域调用前端页面（生产环境应改为白名单）。
+// 前端运行在 http://<host>:80，后端在 :8443，跨端口请求必须放行。
+func corsMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Access-Control-Allow-Origin", "*")
+		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+		w.Header().Set("Access-Control-Allow-Headers", "Content-Type, X-User-Id, X-Password")
+		if r.Method == http.MethodOptions {
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
 // printSetPasswordHint 在终端打印管理员自行设置密码的操作指引。
 // 对应初始化流程：提供了 -admin 但未提供 -admin-pass 的场景，
 // 管理员需通过 /members/set-password 自行设置密码（首次设置无需旧密码）。
@@ -89,7 +104,7 @@ func main() {
 
 	srv := &http.Server{
 		Addr:              fmt.Sprintf(":%d", *port),
-		Handler:           loggingMiddleware(mux),
+		Handler:           corsMiddleware(loggingMiddleware(mux)),
 		ReadHeaderTimeout: 15 * time.Second, // 防止慢速连接长期占用
 		IdleTimeout:       120 * time.Second,
 	}
