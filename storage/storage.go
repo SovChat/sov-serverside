@@ -35,6 +35,10 @@ const (
 	dateLayout = "2006-01-02"
 	// maxChatLineBytes 读取聊天日志时单行允许的最大字节数（密文可能很长）
 	maxChatLineBytes = 16 << 20 // 16MB
+	// maxDisplayNameRunes 显示名（displayName）允许的最大字符数
+	maxDisplayNameRunes = 32
+	// visibilityPublic visibility.txt 中表示「公开频道」的取值
+	visibilityPublic = "public"
 )
 
 // ---------- 错误定义 ----------
@@ -51,6 +55,11 @@ var (
 	ErrNotMember      = errors.New("The userId is not a member.")
 	ErrForbidden      = errors.New("No access processing: admin required.")
 	ErrPathTraversal  = errors.New("Path illegal: path traversal attack detected.")
+
+	// 账号（注册 / 登录）相关错误
+	ErrAccountExists      = errors.New("The userId is already registered.")
+	ErrAccountNotFound    = errors.New("The userId haven't registered yet.")
+	ErrInvalidDisplayName = errors.New("displayName illegal: max 32 characters, no control characters or line breaks.")
 )
 
 // ---------- 格式校验 ----------
@@ -97,13 +106,32 @@ func ValidateFileID(fileId string) error {
 	return nil
 }
 
+// ValidateDisplayName 校验显示名：允许为空（落库时回退为 userId），
+// 最长 maxDisplayNameRunes 个字符，且不得含控制字符或换行（防止写入账号文件时破坏行结构）。
+func ValidateDisplayName(name string) error {
+	if name == "" {
+		return nil
+	}
+	if utf8.RuneCountInString(name) > maxDisplayNameRunes {
+		return ErrInvalidDisplayName
+	}
+	for _, r := range name {
+		if r < 0x20 || r == 0x7f {
+			return ErrInvalidDisplayName
+		}
+	}
+	return nil
+}
+
 // ---------- 数据结构 ----------
 
-// MemberInfo 正式成员信息（members.txt 一行：userId|加入日期|公钥）
+// MemberInfo 正式成员信息（members.txt 一行：userId|加入日期|公钥）。
+// DisplayName 不落 members.txt，而是由 accounts.txt 关联出来的展示字段（可能为空）。
 type MemberInfo struct {
-	UserID     string `json:"userId"`
-	PublicKey  string `json:"publicKey"`
-	JoinedDate string `json:"joinedDate"`
+	UserID      string `json:"userId"`
+	PublicKey   string `json:"publicKey"`
+	JoinedDate  string `json:"joinedDate"`
+	DisplayName string `json:"displayName"`
 }
 
 // PendingInfo 待审批成员信息（unverified_members.txt 一行：userId|申请日期|公钥）
@@ -112,11 +140,21 @@ type PendingInfo struct {
 	RequestDate string `json:"requestDate"`
 }
 
-// HealthStatus GET /health 返回的服务器状态信息
+// AccountInfo 账号信息（serverinfo/accounts.txt 一行一个 JSON 对象）。
+// 密码不在本结构中：bcrypt 哈希单独存放在 serverinfo/passwords/{userId}.hash。
+type AccountInfo struct {
+	UserID      string `json:"userId"`
+	DisplayName string `json:"displayName"`
+	CreatedAt   string `json:"createdAt"`
+}
+
+// HealthStatus GET /health 返回的服务器状态信息。
+// Public 表示本群组是否为公开频道：公开频道允许「注册即入群」，私有群组仍需管理员审批。
 type HealthStatus struct {
 	Status      string `json:"status"`
 	Name        string `json:"name"`
 	MemberCount int    `json:"memberCount"`
+	Public      bool   `json:"public"`
 }
 
 // ---------- 存储主体 ----------
@@ -202,6 +240,16 @@ func (s *Store) membersPath() string {
 
 func (s *Store) unverifiedPath() string {
 	return filepath.Join(s.dir, "serverpersons", "unverified_members.txt")
+}
+
+// accountsPath 账号表路径：serverinfo/accounts.txt（一行一个 JSON 账号对象）
+func (s *Store) accountsPath() string {
+	return filepath.Join(s.dir, "serverinfo", "accounts.txt")
+}
+
+// visibilityPath 群组可见性路径：serverinfo/visibility.txt（public / private）
+func (s *Store) visibilityPath() string {
+	return filepath.Join(s.dir, "serverinfo", "visibility.txt")
 }
 
 // ---------- 通用文件工具 ----------
@@ -302,9 +350,12 @@ func parseMemberLine(line string) (MemberInfo, bool) {
 // Init 首次启动初始化：
 //  1. 写入群组名称与创建日期（已存在则跳过，避免重启覆盖）；
 //  2. 若指定初始管理员：写入 founder.txt、admins.txt（第一行，即群主）与 members.txt；
-//  3. 若提供管理员密码：立即生成 bcrypt 哈希（cost=12）写入 passwords/{admin}.hash；
+//  3. 若提供管理员密码：立即生成 bcrypt 哈希（cost=12）写入 passwords/{admin}.hash，
+//     并同步建立账号记录（accounts.txt），使初始管理员可以直接登录；
 //     若未提供密码：由 main 在终端打印提示，引导管理员通过 /members/set-password 自行设置。
-func (s *Store) Init(admin, adminPass, groupName string) error {
+//  4. 写入群组可见性 serverinfo/visibility.txt（public=注册即入群 / private=需管理员审批），
+//     已存在则跳过，避免重启覆盖。
+func (s *Store) Init(admin, adminPass, groupName string, public bool) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -316,6 +367,14 @@ func (s *Store) Init(admin, adminPass, groupName string) error {
 	}
 	if err := writeFileIfMissing(s.createdDatePath(), today+"\n"); err != nil {
 		return fmt.Errorf("Write created_date.txt failed: %w", err)
+	}
+	// 群组可见性：公开频道允许「注册即入群」，私有群组仍需管理员审批
+	visibility := "private"
+	if public {
+		visibility = visibilityPublic
+	}
+	if err := writeFileIfMissing(s.visibilityPath(), visibility+"\n"); err != nil {
+		return fmt.Errorf("Write visibility.txt failed: %w", err)
 	}
 
 	// 未指定初始管理员：仅完成基础初始化
@@ -361,13 +420,32 @@ func (s *Store) Init(admin, adminPass, groupName string) error {
 	if err := ValidatePassword(adminPass); err != nil {
 		return err
 	}
-	if _, err := os.Stat(s.passwordPath(admin)); os.IsNotExist(err) {
+	if has, err := s.hasPasswordLocked(admin); err != nil {
+		return err
+	} else if !has {
 		// 哈希已存在时不覆盖，避免重启时用启动参数意外重置密码
 		if err := s.savePasswordHashLocked(admin, adminPass); err != nil {
 			return err
 		}
 	}
-	return nil
+	// 同步建立账号记录，使初始管理员可以直接通过 /auth/login 登录
+	return s.ensureAccountLocked(admin, admin)
+}
+
+// ensureAccountLocked 账号记录不存在时补写一条（调用方需持有 s.mu）。
+// 用于把「-admin 启动」创建的初始管理员纳入账号表（displayName 缺省为 userId）。
+func (s *Store) ensureAccountLocked(userId, displayName string) error {
+	if _, ok, err := s.accountLocked(userId); err != nil {
+		return err
+	} else if ok {
+		return nil
+	}
+	acc := AccountInfo{UserID: userId, DisplayName: displayName, CreatedAt: time.Now().Format(dateLayout)}
+	line, err := json.Marshal(acc)
+	if err != nil {
+		return fmt.Errorf("Serialize account failed: %w", err)
+	}
+	return appendLine(s.accountsPath(), string(line))
 }
 
 // savePasswordHashLocked 对密码做 bcrypt 哈希（cost=12）并写入
@@ -638,15 +716,25 @@ func (s *Store) ListMembers() ([]MemberInfo, error) {
 	return s.memberLinesLocked()
 }
 
-// memberLinesLocked 读取并解析全部正式成员行（调用方需持有 s.mu）
+// memberLinesLocked 读取并解析全部正式成员行（调用方需持有 s.mu）。
+// 同时关联 accounts.txt，为成员补上展示用 displayName（账号不存在时为空）。
 func (s *Store) memberLinesLocked() ([]MemberInfo, error) {
 	lines, err := readLines(s.membersPath())
 	if err != nil {
 		return nil, err
 	}
+	displayNames := map[string]string{}
+	if accountLines, err := readLines(s.accountsPath()); err == nil {
+		for _, l := range accountLines {
+			if a, ok := parseAccountLine(l); ok {
+				displayNames[a.UserID] = a.DisplayName
+			}
+		}
+	}
 	members := make([]MemberInfo, 0, len(lines))
 	for _, l := range lines {
 		if m, ok := parseMemberLine(l); ok {
+			m.DisplayName = displayNames[m.UserID]
 			members = append(members, m)
 		}
 	}
@@ -675,6 +763,180 @@ func (s *Store) PendingList(operatorId string) ([]PendingInfo, error) {
 	return pending, nil
 }
 
+// ---------- 账号（注册 / 登录） ----------
+
+// parseAccountLine 解析账号行（JSON Lines 格式）；格式非法的行直接忽略
+func parseAccountLine(line string) (AccountInfo, bool) {
+	var a AccountInfo
+	if err := json.Unmarshal([]byte(line), &a); err != nil {
+		return AccountInfo{}, false
+	}
+	if a.UserID == "" {
+		return AccountInfo{}, false
+	}
+	return a, true
+}
+
+// accountLocked 在账号表中查找某 userId（调用方需持有 s.mu）
+func (s *Store) accountLocked(userId string) (AccountInfo, bool, error) {
+	lines, err := readLines(s.accountsPath())
+	if err != nil {
+		return AccountInfo{}, false, err
+	}
+	for _, l := range lines {
+		if a, ok := parseAccountLine(l); ok && a.UserID == userId {
+			return a, true, nil
+		}
+	}
+	return AccountInfo{}, false, nil
+}
+
+// GetAccount 查询账号信息；第二个返回值表示账号记录是否存在。
+func (s *Store) GetAccount(userId string) (AccountInfo, bool, error) {
+	if !ValidUserID(userId) {
+		return AccountInfo{}, false, ErrInvalidUserID
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.accountLocked(userId)
+}
+
+// hasPasswordLocked 判断密码哈希文件是否已存在（调用方需持有 s.mu）
+func (s *Store) hasPasswordLocked(userId string) (bool, error) {
+	_, err := os.Stat(s.passwordPath(userId))
+	if err == nil {
+		return true, nil
+	}
+	if os.IsNotExist(err) {
+		return false, nil
+	}
+	return false, err
+}
+
+// findPendingLocked 判断 userId 是否已在待审批列表中（调用方需持有 s.mu）
+func (s *Store) findPendingLocked(userId string) (bool, error) {
+	lines, err := readLines(s.unverifiedPath())
+	if err != nil {
+		return false, err
+	}
+	for _, l := range lines {
+		if m, ok := parseMemberLine(l); ok && m.UserID == userId {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
+// appendPendingLocked 把 userId 登记到待审批列表（已存在则跳过；调用方需持有 s.mu）
+func (s *Store) appendPendingLocked(userId string) error {
+	exists, err := s.findPendingLocked(userId)
+	if err != nil {
+		return err
+	}
+	if exists {
+		return nil
+	}
+	return appendLine(s.unverifiedPath(), userId+"|"+time.Now().Format(dateLayout)+"|")
+}
+
+// isPublicLocked 读取群组可见性（调用方需持有 s.mu）。
+// visibility.txt 缺失（升级前的旧数据目录）时按「私有」处理，
+// 避免历史群组在升级后意外开放自助入群。
+func (s *Store) isPublicLocked() (bool, error) {
+	b, err := os.ReadFile(s.visibilityPath())
+	if err != nil {
+		if os.IsNotExist(err) {
+			return false, nil
+		}
+		return false, err
+	}
+	return strings.TrimSpace(string(b)) == visibilityPublic, nil
+}
+
+// IsPublic 返回本群组是否为公开频道（公开频道允许注册即入群）
+func (s *Store) IsPublic() (bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.isPublicLocked()
+}
+
+// CreateAccount 注册新账号：写入 bcrypt 密码哈希（cost=12）并在 accounts.txt 追加账号记录。
+//
+// 入群规则（「只有公开频道注册即入群」）：
+//   - 公开频道（visibility.txt = public）：注册即写入 members.txt 成为正式成员，返回 joined=true；
+//   - 私有群组：仅创建账号，并自动登记一条待审批申请，返回 pending=true，需管理员审批后才能发言。
+//
+// 返回 (账号信息, 是否已直接入群, 是否进入待审批, error)。
+func (s *Store) CreateAccount(userId, password, displayName string) (AccountInfo, bool, bool, error) {
+	if !ValidUserID(userId) {
+		return AccountInfo{}, false, false, ErrInvalidUserID
+	}
+	if err := ValidatePassword(password); err != nil {
+		return AccountInfo{}, false, false, err
+	}
+	if err := ValidateDisplayName(displayName); err != nil {
+		return AccountInfo{}, false, false, err
+	}
+	if displayName == "" {
+		displayName = userId
+	}
+	acc := AccountInfo{
+		UserID:      userId,
+		DisplayName: displayName,
+		CreatedAt:   time.Now().Format(dateLayout),
+	}
+	line, err := json.Marshal(acc)
+	if err != nil {
+		return AccountInfo{}, false, false, fmt.Errorf("Serialize account failed: %w", err)
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	// 账号唯一性：账号表与密码哈希文件任一已存在都视为已注册
+	// （后者覆盖「-admin 启动时已建好密码但还没有账号记录」的初始管理员场景）
+	if _, ok, err := s.accountLocked(userId); err != nil {
+		return AccountInfo{}, false, false, err
+	} else if ok {
+		return AccountInfo{}, false, false, ErrAccountExists
+	}
+	if has, err := s.hasPasswordLocked(userId); err != nil {
+		return AccountInfo{}, false, false, err
+	} else if has {
+		return AccountInfo{}, false, false, ErrAccountExists
+	}
+
+	// 1. 密码哈希落盘
+	if err := s.savePasswordHashLocked(userId, password); err != nil {
+		return AccountInfo{}, false, false, err
+	}
+	// 2. 账号记录落盘
+	if err := appendLine(s.accountsPath(), string(line)); err != nil {
+		return AccountInfo{}, false, false, err
+	}
+	// 3. 入群策略：仅公开频道注册即入群
+	public, err := s.isPublicLocked()
+	if err != nil {
+		return acc, false, false, err
+	}
+	if !public {
+		if err := s.appendPendingLocked(userId); err != nil {
+			return acc, false, false, err
+		}
+		return acc, false, true, nil
+	}
+	isMember, err := s.isMemberLocked(userId)
+	if err != nil {
+		return acc, false, false, err
+	}
+	if !isMember {
+		if err := appendLine(s.membersPath(), userId+"|"+acc.CreatedAt+"|"); err != nil {
+			return acc, false, false, err
+		}
+	}
+	return acc, true, false, nil
+}
+
 // ---------- 服务器信息 ----------
 
 // Health 返回 GET /health 所需的服务器状态（无需验证）：
@@ -693,7 +955,11 @@ func (s *Store) Health() (HealthStatus, error) {
 	if err != nil {
 		return HealthStatus{}, err
 	}
-	return HealthStatus{Status: "ok", Name: name, MemberCount: len(members)}, nil
+	public, err := s.isPublicLocked()
+	if err != nil {
+		return HealthStatus{}, err
+	}
+	return HealthStatus{Status: "ok", Name: name, MemberCount: len(members), Public: public}, nil
 }
 
 // ---------- 聊天消息 ----------
@@ -878,4 +1144,3 @@ func (s *Store) OpenDownloadFile(path string) (string, *os.File, os.FileInfo, er
 	}
 	return abs, f, info, nil
 }
-

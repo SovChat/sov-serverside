@@ -26,4 +26,5 @@ VOLUME ["/data"]
 EXPOSE 8443
 
 ENTRYPOINT ["/usr/local/bin/groupchat-server"]
-CMD ["-port=8443", "-dir=/data"]
+# -public=true：公开频道，注册即入群；如需「注册后等待管理员审批」请改为 -public=false
+CMD ["-port=8443", "-dir=/data", "-public=true"]

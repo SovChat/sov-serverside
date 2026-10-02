@@ -39,7 +39,7 @@ func corsMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Access-Control-Allow-Origin", "*")
 		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
-		w.Header().Set("Access-Control-Allow-Headers", "Content-Type, X-User-Id, X-Password")
+		w.Header().Set("Access-Control-Allow-Headers", "Content-Type, X-User-Id, X-Password, Authorization")
 		if r.Method == http.MethodOptions {
 			w.WriteHeader(http.StatusNoContent)
 			return
@@ -70,7 +70,8 @@ func main() {
 	dir := flag.String("dir", "./data", "data path")
 	admin := flag.String("admin", "", "admin userId")
 	adminPass := flag.String("admin-pass", "", "admin psw")
-	name := flag.String("name", "Untitled Group", "group name(optional, stoarged in serverinfo/name.txt)")
+	name := flag.String("name", "Untitled Group", "group name(optional, stored in serverinfo/name.txt)")
+	public := flag.Bool("public", true, "public channel: register joins the group immediately; false = private group, admin approval required")
 	flag.Parse()
 
 	// -admin-pass 必须与 -admin 一起使用
@@ -87,7 +88,7 @@ func main() {
 	defer store.Close() // 程序退出前关闭聊天日志文件句柄
 
 	// ── 首次启动初始化：群组信息 + 初始管理员 + 管理员密码哈希 ──
-	if err := store.Init(*admin, *adminPass, *name); err != nil {
+	if err := store.Init(*admin, *adminPass, *name, *public); err != nil {
 		log.Fatalf("Server data init failed: %v", err)
 	}
 
@@ -110,7 +111,17 @@ func main() {
 	}
 
 	log.Printf("Group chat server started: port %d, data path %s", *port, store.Dir())
-	log.Printf("Start command example: go run main.go -port=%d -dir=%s -admin=alice -admin-pass=your_password", *port, *dir)
+	// 打印实际生效的可见性（visibility.txt 仅在首次启动时写入，重启不会覆盖）
+	isPublic, err := store.IsPublic()
+	if err != nil {
+		log.Fatalf("Read group visibility failed: %v", err)
+	}
+	visibility := "private (new users need admin approval before chatting)"
+	if isPublic {
+		visibility = "public (register joins the group immediately)"
+	}
+	log.Printf("Group visibility: %s", visibility)
+	log.Printf("Start command example: go run main.go -port=%d -dir=%s -admin=alice -admin-pass=your_password -public=%t", *port, *dir, isPublic)
 	if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 		log.Fatalf("HTTP service exception quit: %v", err)
 	}

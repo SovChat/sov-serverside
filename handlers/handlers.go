@@ -39,13 +39,14 @@ const (
 
 // Handler 封装全部 HTTP 接口处理逻辑
 type Handler struct {
-	store   *storage.Store // 文件存储层
-	limiter *loginLimiter  // 登录防暴力破解器
+	store    *storage.Store // 文件存储层
+	limiter  *loginLimiter  // 登录防暴力破解器
+	sessions *sessionStore  // 登录会话表（内存态，进程重启后全部失效）
 }
 
 // New 创建 Handler
 func New(store *storage.Store) *Handler {
-	return &Handler{store: store, limiter: newLoginLimiter()}
+	return &Handler{store: store, limiter: newLoginLimiter(), sessions: newSessionStore()}
 }
 
 // Register 将全部路由注册到 mux。
@@ -53,6 +54,12 @@ func New(store *storage.Store) *Handler {
 func (h *Handler) Register(mux *http.ServeMux) {
 	// 服务器信息（无需验证）
 	mux.HandleFunc("GET /health", h.handleHealth)
+
+	// 账号与登录：register/login 无需验证；logout/me 通过 Authorization 会话令牌识别身份
+	mux.HandleFunc("POST /auth/register", h.handleAuthRegister)
+	mux.HandleFunc("POST /auth/login", h.handleAuthLogin)
+	mux.HandleFunc("POST /auth/logout", h.handleAuthLogout)
+	mux.HandleFunc("GET /auth/me", h.handleAuthMe)
 
 	// 成员管理
 	mux.HandleFunc("POST /members/apply", h.handleMemberApply)        // 无需验证
@@ -108,8 +115,14 @@ func writeStoreError(w http.ResponseWriter, err error) {
 		writeError(w, http.StatusNotFound, err.Error())
 	case errors.Is(err, storage.ErrUserExists), errors.Is(err, storage.ErrAlreadyApplied),
 		errors.Is(err, storage.ErrInvalidUserID), errors.Is(err, storage.ErrInvalidDate),
-		errors.Is(err, storage.ErrInvalidFileID), errors.Is(err, storage.ErrEmptyPassword):
+		errors.Is(err, storage.ErrInvalidFileID), errors.Is(err, storage.ErrEmptyPassword),
+		errors.Is(err, storage.ErrInvalidDisplayName):
 		writeError(w, http.StatusBadRequest, err.Error())
+	case errors.Is(err, storage.ErrAccountExists):
+		// 账号已存在：409 便于前端提示「该用户名已被注册」
+		writeError(w, http.StatusConflict, err.Error())
+	case errors.Is(err, storage.ErrAccountNotFound):
+		writeError(w, http.StatusNotFound, err.Error())
 	default:
 		log.Printf("Server interior error: %v", err)
 		writeError(w, http.StatusInternalServerError, "Server interior error")
@@ -173,17 +186,42 @@ func (h *Handler) verifyOperator(w http.ResponseWriter, userId, password, failMs
 	return true
 }
 
-// authenticate 从请求头提取并验证 X-User-Id / X-Password。
-// 成功返回操作者 userId；失败时已写出错误响应并返回 ("", false)。
-func (h *Handler) authenticate(w http.ResponseWriter, r *http.Request) (string, bool) {
+// operatorID 解析请求的操作者身份，支持两种方式（登录会话优先）：
+//  1. Authorization: Bearer <token>：登录会话令牌（/auth/login 或 /auth/register 下发）；
+//  2. X-User-Id 请求头：兼容旧的无状态调用方式，调用方还需自行校验密码。
+//
+// 返回 (userId, 是否来自会话令牌, 是否成功)。失败时已写出错误响应。
+func (h *Handler) operatorID(w http.ResponseWriter, r *http.Request) (string, bool, bool) {
+	if token := bearerToken(r); token != "" {
+		userId, ok := h.sessions.lookup(token)
+		if !ok {
+			writeError(w, http.StatusUnauthorized, "Session invalid or expired, please login again")
+			return "", false, false
+		}
+		return userId, true, true
+	}
 	userId := r.Header.Get("X-User-Id")
 	if userId == "" {
 		writeError(w, http.StatusUnauthorized, "Lack X-User-Id header")
-		return "", false
+		return "", false, false
 	}
 	if !storage.ValidUserID(userId) {
 		writeError(w, http.StatusBadRequest, "X-User-Id format illegal")
+		return "", false, false
+	}
+	return userId, false, true
+}
+
+// authenticate 校验请求身份：携带有效会话令牌时直接通过，
+// 否则回退到 X-User-Id + X-Password（bcrypt 比对 + 防暴力破解延迟）。
+// 成功返回操作者 userId；失败时已写出错误响应并返回 ("", false)。
+func (h *Handler) authenticate(w http.ResponseWriter, r *http.Request) (string, bool) {
+	userId, fromSession, ok := h.operatorID(w, r)
+	if !ok {
 		return "", false
+	}
+	if fromSession {
+		return userId, true
 	}
 	if !h.verifyOperator(w, userId, r.Header.Get("X-Password"), "Auth failed: userId or psw wrong") {
 		return "", false
@@ -374,14 +412,10 @@ type setPasswordRequest struct {
 // 成功写入 bcrypt 哈希（cost=12）后返回 {"success":true}。
 func (h *Handler) handleSetPassword(w http.ResponseWriter, r *http.Request) {
 	// 注意：此接口不能直接复用 authenticate——两种情形的验证规则不同，
-	// 且首次引导设置时目标用户尚无密码可验证，因此手动处理请求头。
-	userId := r.Header.Get("X-User-Id")
-	if userId == "" {
-		writeError(w, http.StatusUnauthorized, "Lack X-User-Id header")
-		return
-	}
-	if !storage.ValidUserID(userId) {
-		writeError(w, http.StatusBadRequest, "X-User-Id format illegal")
+	// 且首次引导设置时目标用户尚无密码可验证，因此这里单独解析身份。
+	// 会话令牌与 X-User-Id 两种方式都支持：令牌本身已证明身份，无需再验旧密码。
+	userId, fromSession, ok := h.operatorID(w, r)
+	if !ok {
 		return
 	}
 	var req setPasswordRequest
@@ -405,8 +439,9 @@ func (h *Handler) handleSetPassword(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		if has {
-			// 已有旧密码：必须验证 X-Password 是旧密码（含防暴力破解延迟）
-			if !h.verifyOperator(w, userId, r.Header.Get("X-Password"), "Auth failed: old psw wrong") {
+			// 已有旧密码：必须验证 X-Password 是旧密码（含防暴力破解延迟）；
+			// 通过登录会话调用时身份已由令牌证明，跳过旧密码校验。
+			if !fromSession && !h.verifyOperator(w, userId, r.Header.Get("X-Password"), "Auth failed: old psw wrong") {
 				return
 			}
 		} else {
@@ -424,8 +459,8 @@ func (h *Handler) handleSetPassword(w http.ResponseWriter, r *http.Request) {
 		}
 	} else {
 		// ── 情形二：管理员代设密码 ──
-		// 先验证操作者本人的密码，再确认其管理员身份；目标用户无需提供旧密码
-		if !h.verifyOperator(w, userId, r.Header.Get("X-Password"), "Auth failed: userId or psw wrong") {
+		// 先验证操作者身份（会话令牌或密码），再确认其管理员身份；目标用户无需提供旧密码
+		if !fromSession && !h.verifyOperator(w, userId, r.Header.Get("X-Password"), "Auth failed: userId or psw wrong") {
 			return
 		}
 		isAdmin, err := h.store.IsAdmin(userId)
@@ -449,6 +484,8 @@ func (h *Handler) handleSetPassword(w http.ResponseWriter, r *http.Request) {
 		writeStoreError(w, err)
 		return
 	}
+	// 密码已变更：吊销该用户的其他登录会话，保留本次调用者自己的令牌（若有）
+	h.sessions.revokeUser(req.UserID, bearerToken(r))
 	writeOK(w, nil)
 }
 
@@ -650,4 +687,3 @@ func (h *Handler) handleFileDownload(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Disposition", fmt.Sprintf("attachment; filename=%q", filepath.Base(absPath)))
 	http.ServeContent(w, r, "", info.ModTime(), f)
 }
-
