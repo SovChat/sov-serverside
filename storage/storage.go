@@ -54,7 +54,15 @@ var (
 	ErrNotPending     = errors.New("The userId is not in the pending list.")
 	ErrNotMember      = errors.New("The userId is not a member.")
 	ErrForbidden      = errors.New("No access processing: admin required.")
-	ErrPathTraversal  = errors.New("Path illegal: path traversal attack detected.")
+	ErrModOnAdmin     = errors.New("No access processing: mods cannot act on admins.")
+	ErrInvalidRole    = errors.New(`role illegal: only "admin", "mod" or "none" is allowed.`)
+	// ErrLastAdmin 降级/移除最后一个管理员时返回（铁律：服务器必须始终保有管理员）
+	ErrLastAdmin = errors.New("Cannot demote the last remaining admin.")
+	// ErrInvalidIP IP 地址格式非法
+	ErrInvalidIP = errors.New("IP address format is illegal.")
+	// ErrNoIPFound 目标用户从未记录过来源 IP（banip 需要 IP 时）
+	ErrNoIPFound     = errors.New("No known IP recorded for this user.")
+	ErrPathTraversal = errors.New("Path illegal: path traversal attack detected.")
 
 	// 账号（注册 / 登录）相关错误
 	ErrAccountExists      = errors.New("The userId is already registered.")
@@ -179,7 +187,7 @@ func NewStore(dir string) (*Store, error) {
 	// 启动时自动创建的目录结构（与需求中的目录树一致）
 	subDirs := []string{
 		"serverinfo/passwords", // bcrypt 密码哈希（cost=12）
-		"serverpersons",        // admins.txt / members.txt / unverified_members.txt
+		"serverpersons",        // roles.txt / members.txt / unverified_members.txt
 		"memberprofiles",       // 用户头像 {userId}.png（预留，可后续实现）
 		"chat",                 // 聊天记录 {YYYY-MM-DD}.log（按天分割）
 		"files",                // 加密文件 {YYYY-MM-DD}/{fileId}.enc|.keys
@@ -349,7 +357,7 @@ func parseMemberLine(line string) (MemberInfo, bool) {
 
 // Init 首次启动初始化：
 //  1. 写入群组名称与创建日期（已存在则跳过，避免重启覆盖）；
-//  2. 若指定初始管理员：写入 founder.txt、admins.txt（第一行，即群主）与 members.txt；
+//  2. 若指定初始管理员：写入 founder.txt、roles.txt（admin 角色，即群主）与 members.txt；
 //  3. 若提供管理员密码：立即生成 bcrypt 哈希（cost=12）写入 passwords/{admin}.hash，
 //     并同步建立账号记录（accounts.txt），使初始管理员可以直接登录；
 //     若未提供密码：由 main 在终端打印提示，引导管理员通过 /members/set-password 自行设置。
@@ -389,10 +397,11 @@ func (s *Store) Init(admin, adminPass, groupName string, public bool) error {
 	if err := writeFileIfMissing(s.founderPath(), admin+"\n"); err != nil {
 		return fmt.Errorf("Write founder.txt failed: %w", err)
 	}
-	// admins.txt：首次创建时管理员为第一行（群主）；已存在则不改动
-	if _, err := os.Stat(s.adminsPath()); os.IsNotExist(err) {
-		if err := os.WriteFile(s.adminsPath(), []byte(admin+"\n"), 0600); err != nil {
-			return fmt.Errorf("Write admins.txt failed: %w", err)
+	// roles.txt：首次创建时管理员为第一条 admin 记录（群主）；已存在则不改动。
+	// （旧版写入 admins.txt，现由 roles.txt 承担；旧数据在首次访问时自动迁移）
+	if _, err := os.Stat(s.rolesPath()); os.IsNotExist(err) {
+		if err := os.WriteFile(s.rolesPath(), []byte(RoleAdmin+"|"+admin+"\n"), 0600); err != nil {
+			return fmt.Errorf("Write roles.txt failed: %w", err)
 		}
 	}
 	// members.txt：创建者本人即为成员（公钥暂为空）
@@ -531,18 +540,14 @@ func (s *Store) IsAdmin(userId string) (bool, error) {
 	return s.isAdminLocked(userId)
 }
 
-// isAdminLocked（调用方需持有 s.mu）
+// isAdminLocked 判断某用户是否为 admin 角色（roles.txt，旧 admins.txt 自动迁移；
+// 调用方需持有 s.mu）
 func (s *Store) isAdminLocked(userId string) (bool, error) {
-	lines, err := readLines(s.adminsPath())
+	role, err := s.getRoleLocked(userId)
 	if err != nil {
 		return false, err
 	}
-	for _, l := range lines {
-		if l == userId {
-			return true, nil
-		}
-	}
-	return false, nil
+	return role == RoleAdmin, nil
 }
 
 // IsMember 判断某用户是否为正式成员
@@ -621,11 +626,21 @@ func (s *Store) moveFromPending(operatorId, userId string, approve bool) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	// 权限铁律：修改成员列表的操作必须是管理员
-	if ok, err := s.isAdminLocked(operatorId); err != nil {
+	// 权限铁律：修改成员列表的操作必须是版主及以上（admin 或 mod）
+	if ok, err := s.isModOrAboveLocked(operatorId); err != nil {
 		return err
 	} else if !ok {
 		return ErrForbidden
+	}
+	// 版主不能操作管理员：目标 userId 是 admin 角色时，操作者也必须是 admin
+	if tRole, err := s.getRoleLocked(userId); err != nil {
+		return err
+	} else if tRole == RoleAdmin {
+		if oRole, err := s.getRoleLocked(operatorId); err != nil {
+			return err
+		} else if oRole != RoleAdmin {
+			return ErrModOnAdmin
+		}
 	}
 
 	// 从待审批列表查找并移除该 userId
@@ -689,7 +704,7 @@ func (s *Store) Leave(userId string) error {
 		return err
 	}
 
-	// 若该用户是管理员，同时从 admins.txt 移除
+	// 若该用户是旧版 admins.txt 中的管理员，同时移除（兼容未迁移数据；迁移后此文件不再被读取）
 	adminLines, err := readLines(s.adminsPath())
 	if err != nil {
 		return err
@@ -704,7 +719,27 @@ func (s *Store) Leave(userId string) error {
 		adminRemaining = append(adminRemaining, l)
 	}
 	if adminChanged {
-		return rewriteLines(s.adminsPath(), adminRemaining)
+		if err := rewriteLines(s.adminsPath(), adminRemaining); err != nil {
+			return err
+		}
+	}
+
+	// 同时从角色表 roles.txt 移除该用户的角色记录
+	roleEntries, err := s.loadRolesLocked()
+	if err != nil {
+		return err
+	}
+	roleChanged := false
+	roleRemaining := make([]RoleEntry, 0, len(roleEntries))
+	for _, e := range roleEntries {
+		if e.UserID == userId {
+			roleChanged = true
+			continue
+		}
+		roleRemaining = append(roleRemaining, e)
+	}
+	if roleChanged {
+		return s.saveRolesLocked(roleRemaining)
 	}
 	return nil
 }
@@ -741,11 +776,11 @@ func (s *Store) memberLinesLocked() ([]MemberInfo, error) {
 	return members, nil
 }
 
-// PendingList 返回待审批成员列表（权限铁律：仅管理员可查看）
+// PendingList 返回待审批成员列表（权限铁律：仅版主及以上可查看）
 func (s *Store) PendingList(operatorId string) ([]PendingInfo, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if ok, err := s.isAdminLocked(operatorId); err != nil {
+	if ok, err := s.isModOrAboveLocked(operatorId); err != nil {
 		return nil, err
 	} else if !ok {
 		return nil, ErrForbidden
