@@ -169,7 +169,7 @@ func (l *loginLimiter) reset(userId string) {
 func (h *Handler) verifyOperator(w http.ResponseWriter, userId, password, failMsg string) bool {
 	ok, err := h.store.VerifyPassword(userId, password)
 	if err != nil {
-		log.Printf("Interior error occured while verifying psw: userId=%s err=%v", userId, err)
+		log.Printf("Interior error occurred while verifying psw: userId=%s err=%v", userId, err)
 		writeError(w, http.StatusInternalServerError, "Server interior error")
 		return false
 	}
@@ -610,7 +610,7 @@ func (h *Handler) handleFileUploadCommon(w http.ResponseWriter, r *http.Request,
 	}
 	file, _, err := r.FormFile(field)
 	if err != nil {
-		writeError(w, http.StatusBadRequest, "Lack chart file field"+field)
+		writeError(w, http.StatusBadRequest, "Lack chat file field"+field)
 		return
 	}
 	defer file.Close()
