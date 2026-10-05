@@ -12,6 +12,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"net"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -63,12 +64,17 @@ func (h *Handler) Register(mux *http.ServeMux) {
 
 	// 成员管理
 	mux.HandleFunc("POST /members/apply", h.handleMemberApply)        // 无需验证
-	mux.HandleFunc("POST /members/approve", h.handleMemberApprove)    // 需验证 + 管理员
-	mux.HandleFunc("POST /members/reject", h.handleMemberReject)      // 需验证 + 管理员
+	mux.HandleFunc("POST /members/approve", h.handleMemberApprove)    // 需验证 + 版主及以上
+	mux.HandleFunc("POST /members/reject", h.handleMemberReject)      // 需验证 + 版主及以上
 	mux.HandleFunc("GET /members/list", h.handleMemberList)           // 无需验证
-	mux.HandleFunc("GET /members/pending", h.handleMemberPending)     // 需验证 + 管理员
+	mux.HandleFunc("GET /members/pending", h.handleMemberPending)     // 需验证 + 版主及以上
 	mux.HandleFunc("POST /members/leave", h.handleMemberLeave)        // 需验证
 	mux.HandleFunc("POST /members/set-password", h.handleSetPassword) // 需验证
+	// 管理接口（需验证；具体权限在各自 handler 内校验）
+	mux.HandleFunc("POST /admin/set-role", h.handleSetRole) // 需验证 + 管理员
+	mux.HandleFunc("POST /admin/give", h.handleAdminGive)   // 需验证 + 根管理员
+	mux.HandleFunc("GET /admin/roles", h.handleAdminRoles)  // 需验证 + 版主及以上
+	mux.HandleFunc("POST /admin/cmd", h.handleAdminCmd)     // 需验证 + 版主及以上
 
 	// 聊天消息（全部需验证）
 	mux.HandleFunc("POST /chat/send", h.handleChatSend)
@@ -106,17 +112,18 @@ func writeOK(w http.ResponseWriter, extra map[string]any) {
 // writeStoreError 将 storage 层错误映射为对应的 HTTP 状态码响应
 func writeStoreError(w http.ResponseWriter, err error) {
 	switch {
-	case errors.Is(err, storage.ErrForbidden):
+	case errors.Is(err, storage.ErrForbidden), errors.Is(err, storage.ErrModOnAdmin):
 		writeError(w, http.StatusForbidden, err.Error())
 	case errors.Is(err, storage.ErrPathTraversal):
 		// 路径遍历攻击：按铁律返回 400 Bad Request
 		writeError(w, http.StatusBadRequest, err.Error())
-	case errors.Is(err, storage.ErrNotPending), errors.Is(err, storage.ErrNotMember):
+	case errors.Is(err, storage.ErrNotPending), errors.Is(err, storage.ErrNotMember), errors.Is(err, storage.ErrNoIPFound):
 		writeError(w, http.StatusNotFound, err.Error())
 	case errors.Is(err, storage.ErrUserExists), errors.Is(err, storage.ErrAlreadyApplied),
 		errors.Is(err, storage.ErrInvalidUserID), errors.Is(err, storage.ErrInvalidDate),
 		errors.Is(err, storage.ErrInvalidFileID), errors.Is(err, storage.ErrEmptyPassword),
-		errors.Is(err, storage.ErrInvalidDisplayName):
+		errors.Is(err, storage.ErrInvalidDisplayName), errors.Is(err, storage.ErrInvalidRole),
+		errors.Is(err, storage.ErrLastAdmin), errors.Is(err, storage.ErrInvalidIP):
 		writeError(w, http.StatusBadRequest, err.Error())
 	case errors.Is(err, storage.ErrAccountExists):
 		// 账号已存在：409 便于前端提示「该用户名已被注册」
@@ -126,6 +133,60 @@ func writeStoreError(w http.ResponseWriter, err error) {
 	default:
 		log.Printf("Server interior error: %v", err)
 		writeError(w, http.StatusInternalServerError, "Server interior error")
+	}
+}
+
+// ---------- 来源 IP：提取 / 封禁校验 / 记录 ----------
+
+// clientIP 提取请求来源 IP（仅 host，不含端口；支持反向代理透传的 X-Forwarded-For 首个地址）
+func clientIP(r *http.Request) string {
+	if xf := r.Header.Get("X-Forwarded-For"); xf != "" {
+		if i := strings.IndexByte(xf, ','); i != -1 {
+			xf = xf[:i]
+		}
+		if ip := strings.TrimSpace(xf); ip != "" {
+			return ip
+		}
+	}
+	host, _, err := net.SplitHostPort(r.RemoteAddr)
+	if err != nil {
+		return r.RemoteAddr
+	}
+	return host
+}
+
+// rejectBannedIP 已被封禁来源 IP 的请求直接拒绝（403）。返回 false 表示已写出响应。
+func (h *Handler) rejectBannedIP(w http.ResponseWriter, r *http.Request) bool {
+	banned, err := h.store.IsIPBanned(clientIP(r))
+	if err != nil {
+		writeStoreError(w, err)
+		return false
+	}
+	if banned {
+		writeError(w, http.StatusForbidden, "Your IP has been banned.")
+		return false
+	}
+	return true
+}
+
+// rejectBannedAccount 已被封禁账号的请求直接拒绝（403）。返回 false 表示已写出响应。
+func (h *Handler) rejectBannedAccount(w http.ResponseWriter, operator string) bool {
+	banned, err := h.store.IsUserBanned(operator)
+	if err != nil {
+		writeStoreError(w, err)
+		return false
+	}
+	if banned {
+		writeError(w, http.StatusForbidden, "Your account has been banned.")
+		return false
+	}
+	return true
+}
+
+// noteLastIP 记录用户最近一次来源 IP（尽力而为：失败仅记日志，不影响主流程）
+func (h *Handler) noteLastIP(r *http.Request, userId string) {
+	if err := h.store.RecordLastIP(userId, clientIP(r)); err != nil {
+		log.Printf("Record last IP failed for %s: %v", userId, err)
 	}
 }
 
@@ -243,6 +304,26 @@ func (h *Handler) requireMember(w http.ResponseWriter, userId string) bool {
 	return true
 }
 
+// requireRole 校验操作者角色等级（两级角色：admin 最高，mod 次之）：
+// minRole=storage.RoleAdmin 时仅管理员放行；minRole=storage.RoleMod 时管理员与版主均放行。
+// 不满足时写出 403 并返回 false。
+func (h *Handler) requireRole(w http.ResponseWriter, userId, minRole string) bool {
+	role, err := h.store.GetRole(userId)
+	if err != nil {
+		writeStoreError(w, err)
+		return false
+	}
+	if role == minRole || (minRole == storage.RoleMod && role == storage.RoleAdmin) {
+		return true
+	}
+	if minRole == storage.RoleAdmin {
+		writeError(w, http.StatusForbidden, "Only admins can process this.")
+	} else {
+		writeError(w, http.StatusForbidden, "Only admins or mods can process this.")
+	}
+	return false
+}
+
 // decodeJSONBody 解析 JSON 请求体（限制大小，防止恶意超大请求体）
 func decodeJSONBody(w http.ResponseWriter, r *http.Request, v any) bool {
 	r.Body = http.MaxBytesReader(w, r.Body, maxJSONBodyBytes)
@@ -291,6 +372,15 @@ func (h *Handler) handleMemberApply(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "publicKey too long (≤8192 characters)")
 		return
 	}
+	// 申请前记录最近来源 IP（供后续 banip 使用）；已被封禁的来源 IP 直接拒绝（403）
+	if !h.rejectBannedIP(w, r) {
+		return
+	}
+	// 已被封禁的账号不允许再次申请入群（403）
+	if !h.rejectBannedAccount(w, req.UserID) {
+		return
+	}
+	h.noteLastIP(r, req.UserID)
 	// 公钥按 Opaque 字符串原样存储，服务器不做任何解码或解析
 	if err := h.store.Apply(req.UserID, req.PublicKey); err != nil {
 		writeStoreError(w, err)
@@ -318,6 +408,10 @@ func (h *Handler) handleMemberApprove(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "userId cannot be blank")
 		return
 	}
+	// 版主及以上可批准；目标若是管理员，仅管理员可操作（storage 层同锁内再校验一次）
+	if !h.requireRole(w, operator, storage.RoleMod) {
+		return
+	}
 	// 管理员权限校验与文件操作在 storage 层同一把锁内原子完成
 	if err := h.store.Approve(operator, req.UserID); err != nil {
 		writeStoreError(w, err)
@@ -338,6 +432,10 @@ func (h *Handler) handleMemberReject(w http.ResponseWriter, r *http.Request) {
 	}
 	if req.UserID == "" {
 		writeError(w, http.StatusBadRequest, "userId cannot be blank")
+		return
+	}
+	// 版主及以上可拒绝；目标若是管理员，仅管理员可操作（storage 层同锁内再校验一次）
+	if !h.requireRole(w, operator, storage.RoleMod) {
 		return
 	}
 	if err := h.store.Reject(operator, req.UserID); err != nil {
@@ -363,6 +461,10 @@ func (h *Handler) handleMemberPending(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
+	// 版主及以上可查看待审批列表
+	if !h.requireRole(w, operator, storage.RoleMod) {
+		return
+	}
 	pending, err := h.store.PendingList(operator)
 	if err != nil {
 		writeStoreError(w, err)
@@ -386,12 +488,347 @@ func (h *Handler) handleMemberLeave(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusForbidden, "You can only quit your own account: userId must be the same with X-User-Id")
 		return
 	}
-	// 从 members.txt 移除；若在 admins.txt 中则一并移除（storage 层原子完成）
+	// 从 members.txt 移除；若在 roles.txt（旧 admins.txt）中则一并移除（storage 层原子完成）
 	if err := h.store.Leave(req.UserID); err != nil {
 		writeStoreError(w, err)
 		return
 	}
 	writeOK(w, nil)
+}
+
+// setRoleRequest POST /admin/set-role 请求体：role 为 "admin"、"mod" 或 "none"（移除角色）
+type setRoleRequest struct {
+	UserID string `json:"userId"`
+	Role   string `json:"role"`
+}
+
+// handleSetRole POST /admin/set-role（需验证 + 管理员）：设置或移除用户角色。
+// role 取值：admin | mod | none。铁律：
+//   - 操作者不能改动自己的角色（防自降后失去权限导致的管理真空）；
+//   - 最后一个管理员不可被降级/移除（storage 层同锁内原子校验）；
+//   - 仅 admin 可通过本接口授予/剥夺 admin 角色。
+func (h *Handler) handleSetRole(w http.ResponseWriter, r *http.Request) {
+	operator, ok := h.authenticate(w, r)
+	if !ok {
+		return
+	}
+	// 仅管理员可变更角色
+	if !h.requireRole(w, operator, storage.RoleAdmin) {
+		return
+	}
+	var req setRoleRequest
+	if !decodeJSONBody(w, r, &req) {
+		return
+	}
+	if req.UserID == "" {
+		writeError(w, http.StatusBadRequest, "userId cannot be blank")
+		return
+	}
+	if !storage.ValidUserID(req.UserID) {
+		writeError(w, http.StatusBadRequest, storage.ErrInvalidUserID.Error())
+		return
+	}
+	req.Role = strings.TrimSpace(req.Role)
+	if req.Role != storage.RoleAdmin && req.Role != storage.RoleMod && req.Role != storage.RoleNone {
+		writeError(w, http.StatusBadRequest, storage.ErrInvalidRole.Error())
+		return
+	}
+	if req.UserID == operator {
+		writeError(w, http.StatusBadRequest, "You cannot change your own role.")
+		return
+	}
+	if err := h.store.SetRole(req.UserID, req.Role); err != nil {
+		writeStoreError(w, err)
+		return
+	}
+	writeOK(w, map[string]any{"role": req.Role})
+}
+
+// adminGiveRequest POST /admin/give 请求体：根管理员移交，必须显式 confirm=true
+type adminGiveRequest struct {
+	UserID  string `json:"userId"`
+	Confirm bool   `json:"confirm"`
+}
+
+// handleAdminGive POST /admin/give（需验证 + 根管理员）：将根管理员身份移交给他人。
+// 铁律：只能由当前根管理员发起；目标不能是自己；必须携带 confirm=true 二次确认。
+// 移交后：目标升为 admin（置于角色表首），原根管理员自动降为 mod。
+func (h *Handler) handleAdminGive(w http.ResponseWriter, r *http.Request) {
+	operator, ok := h.authenticate(w, r)
+	if !ok {
+		return
+	}
+	// 仅根管理员可移交
+	isRoot, err := h.store.IsRootAdmin(operator)
+	if err != nil {
+		writeStoreError(w, err)
+		return
+	}
+	if !isRoot {
+		writeError(w, http.StatusForbidden, "Only the root admin can transfer ownership.")
+		return
+	}
+	var req adminGiveRequest
+	if !decodeJSONBody(w, r, &req) {
+		return
+	}
+	output, err := h.transferRoot(operator, strings.TrimSpace(req.UserID), req.Confirm)
+	h.respondCmdResult(w, output, err)
+}
+
+// transferRoot 校验并执行根管理员移交，返回给用户看的输出文本（英文）。
+// /admin/give 接口与 /admin/cmd 的 give 命令共用此逻辑。
+func (h *Handler) transferRoot(operator, target string, confirmed bool) (string, error) {
+	if target == "" {
+		return "", cmdErrf(http.StatusBadRequest, "usage: give <userId> --confirm")
+	}
+	if !storage.ValidUserID(target) {
+		return "", storage.ErrInvalidUserID
+	}
+	if target == operator {
+		return "", cmdErrf(http.StatusBadRequest, "You cannot transfer root admin to yourself.")
+	}
+	if !confirmed {
+		return "", cmdErrf(http.StatusBadRequest, `Confirmation required: resend with "confirm":true (or --confirm argument).`)
+	}
+	if err := h.store.TransferRootAdmin(operator, target); err != nil {
+		return "", err
+	}
+	return "Root admin transferred to " + target + ". You are now a mod.", nil
+}
+
+// handleAdminRoles GET /admin/roles（需验证 + 版主及以上）：返回全部角色记录。
+// 每条记录形如 {"role":"admin|mod","userId":"..."}（roles.txt 顺序，第一条 admin 即根管理员）。
+func (h *Handler) handleAdminRoles(w http.ResponseWriter, r *http.Request) {
+	operator, ok := h.authenticate(w, r)
+	if !ok {
+		return
+	}
+	if !h.requireRole(w, operator, storage.RoleMod) {
+		return
+	}
+	entries, err := h.store.ListRoles()
+	if err != nil {
+		writeStoreError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"roles": entries})
+}
+
+// adminCmdRequest POST /admin/cmd 请求体：command 为命令名，args 为参数列表。
+// 前端 @cmd 模式把 "@cmd kick bob" 解析为 {"command":"kick","args":["bob"]}。
+type adminCmdRequest struct {
+	Command string   `json:"command"`
+	Args    []string `json:"args"`
+}
+
+// adminCmdError 命令级错误（用法错误 / 未知命令 / 权限不足），带目标 HTTP 状态码
+type adminCmdError struct {
+	status int
+	msg    string
+}
+
+func (e *adminCmdError) Error() string { return e.msg }
+
+// cmdErrf 构造一个命令级错误
+func cmdErrf(status int, format string, a ...any) *adminCmdError {
+	return &adminCmdError{status: status, msg: fmt.Sprintf(format, a...)}
+}
+
+// respondCmdResult 统一输出命令执行结果：
+// 成功 → 200 {"success":true,"output":"..."}；失败 → 对应状态码 {"success":false,"error":"..."}。
+func (h *Handler) respondCmdResult(w http.ResponseWriter, output string, err error) {
+	if err != nil {
+		var ce *adminCmdError
+		if errors.As(err, &ce) {
+			writeError(w, ce.status, ce.msg)
+			return
+		}
+		writeStoreError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"success": true, "output": output})
+}
+
+// handleAdminCmd POST /admin/cmd（需验证）：管理员命令分发器。
+// 权限模型：版主可用基础治理命令；管理员额外可用角色命令；give 仅根管理员。
+// 全部输出为英文；错误统一 {"success":false,"error":"..."}。
+func (h *Handler) handleAdminCmd(w http.ResponseWriter, r *http.Request) {
+	operator, ok := h.authenticate(w, r)
+	if !ok {
+		return
+	}
+	// 版主及以上可用命令分发器
+	role, err := h.store.GetRole(operator)
+	if err != nil {
+		writeStoreError(w, err)
+		return
+	}
+	if role != storage.RoleAdmin && role != storage.RoleMod {
+		writeError(w, http.StatusForbidden, "permission denied")
+		return
+	}
+	var req adminCmdRequest
+	if !decodeJSONBody(w, r, &req) {
+		return
+	}
+	output, err := h.runAdminCmd(operator, role, strings.TrimSpace(req.Command), req.Args)
+	h.respondCmdResult(w, output, err)
+}
+
+// runAdminCmd 执行单条命令，返回 (输出文本, 错误)。
+// 参数个数与用法在此校验；存储层错误原样上抛（由 writeStoreError 映射状态码）。
+func (h *Handler) runAdminCmd(operator, role, cmd string, args []string) (string, error) {
+	isAdmin := role == storage.RoleAdmin
+	isMod := isAdmin || role == storage.RoleMod
+	permDenied := func() error {
+		return &adminCmdError{status: http.StatusForbidden, msg: "permission denied"}
+	}
+	usageErr := func(usage string) error {
+		return cmdErrf(http.StatusBadRequest, "usage: %s", usage)
+	}
+	needArgs := func(n int, usage string) bool {
+		return len(args) == n
+	}
+
+	// 命令权限闸门
+	switch cmd {
+	case "kick", "ban", "banip", "forgive", "forgiveip", "list-roles", "help":
+		if !isMod {
+			return "", permDenied()
+		}
+	case "mod", "unmod", "give":
+		if !isAdmin {
+			return "", permDenied()
+		}
+	default:
+		return "", cmdErrf(http.StatusBadRequest, "unknown command: %s", cmd)
+	}
+
+	switch cmd {
+	case "kick": // 踢出成员（仅移出成员表，不封禁）
+		if !needArgs(1, "kick <userId>") {
+			return "", usageErr("kick <userId>")
+		}
+		if err := h.store.RemoveMember(args[0]); err != nil {
+			return "", err
+		}
+		return "kicked " + args[0], nil
+	case "ban": // 封禁账号（移出成员表并写入 banned_users.txt）
+		if !needArgs(1, "ban <userId>") {
+			return "", usageErr("ban <userId>")
+		}
+		if err := h.store.BanUser(args[0]); err != nil {
+			return "", err
+		}
+		return "banned " + args[0], nil
+	case "banip": // 封禁目标用户最近一次记录的来源 IP
+		if !needArgs(1, "banip <userId>") {
+			return "", usageErr("banip <userId>")
+		}
+		if err := h.store.BanUserIP(args[0]); err != nil {
+			return "", err
+		}
+		return "banned IP of " + args[0], nil
+	case "forgive": // 解封账号
+		if !needArgs(1, "forgive <userId>") {
+			return "", usageErr("forgive <userId>")
+		}
+		if err := h.store.ForgiveUser(args[0]); err != nil {
+			return "", err
+		}
+		return "forgiven " + args[0], nil
+	case "forgiveip": // 解封 IP
+		if !needArgs(1, "forgiveip <ip>") {
+			return "", usageErr("forgiveip <ip>")
+		}
+		if err := h.store.ForgiveIP(args[0]); err != nil {
+			return "", err
+		}
+		return "forgiven IP " + args[0], nil
+	case "list-roles": // 列出全部角色记录（第一条 admin 即根管理员）
+		if !needArgs(0, "list-roles") {
+			return "", usageErr("list-roles")
+		}
+		entries, err := h.store.ListRoles()
+		if err != nil {
+			return "", err
+		}
+		if len(entries) == 0 {
+			return "no roles", nil
+		}
+		lines := make([]string, 0, len(entries))
+		for _, e := range entries {
+			lines = append(lines, e.Role+"\t"+e.UserID)
+		}
+		return strings.Join(lines, "\n"), nil
+	case "help": // 显示命令列表（按权限裁剪）
+		if !needArgs(0, "help") {
+			return "", usageErr("help")
+		}
+		return adminCmdHelp(isAdmin), nil
+	case "mod": // 授予版主角色
+		if !needArgs(1, "mod <userId>") {
+			return "", usageErr("mod <userId>")
+		}
+		if err := h.store.SetRole(args[0], storage.RoleMod); err != nil {
+			return "", err
+		}
+		return args[0] + " is now a mod", nil
+	case "unmod": // 移除版主角色
+		if !needArgs(1, "unmod <userId>") {
+			return "", usageErr("unmod <userId>")
+		}
+		if err := h.store.SetRole(args[0], storage.RoleNone); err != nil {
+			return "", err
+		}
+		return args[0] + " is no longer a mod", nil
+	case "give": // 移交根管理员（需要 --confirm 参数）
+		confirmed := false
+		target := ""
+		for _, a := range args {
+			if a == "--confirm" {
+				confirmed = true
+			} else if target == "" {
+				target = a
+			}
+		}
+		if target == "" {
+			return "", usageErr("give <userId> --confirm")
+		}
+		// 仅根管理员可移交
+		isRoot, err := h.store.IsRootAdmin(operator)
+		if err != nil {
+			return "", err
+		}
+		if !isRoot {
+			return "", permDenied()
+		}
+		return h.transferRoot(operator, target, confirmed)
+	}
+	// 上面 switch 已覆盖全部命令，理论不可达
+	return "", cmdErrf(http.StatusBadRequest, "unknown command: %s", cmd)
+}
+
+// adminCmdHelp 返回 help 命令输出（英文；管理员额外可见角色命令）
+func adminCmdHelp(isAdmin bool) string {
+	lines := []string{
+		"kick <userId> - remove a member (no ban)",
+		"ban <userId> - remove a member and ban the account",
+		"banip <userId> - ban the user's last known IP",
+		"forgive <userId> - unban an account",
+		"forgiveip <ip> - unban an IP",
+		"list-roles - list all roles",
+		"help - show this help",
+	}
+	if isAdmin {
+		lines = append(lines,
+			"mod <userId> - grant the mod role",
+			"unmod <userId> - remove the mod role",
+			"give <userId> --confirm - transfer root admin",
+		)
+	}
+	return strings.Join(lines, "\n")
 }
 
 // setPasswordRequest POST /members/set-password 请求体
@@ -458,18 +895,22 @@ func (h *Handler) handleSetPassword(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 	} else {
-		// ── 情形二：管理员代设密码 ──
-		// 先验证操作者身份（会话令牌或密码），再确认其管理员身份；目标用户无需提供旧密码
+		// ── 情形二：版主及以上代设密码 ──
+		// 先验证操作者身份（会话令牌或密码），再确认其角色；目标用户无需提供旧密码。
+		// 版主可以代设普通成员的密码，但不能操作管理员（仅管理员可对管理员操作）。
 		if !fromSession && !h.verifyOperator(w, userId, r.Header.Get("X-Password"), "Auth failed: userId or psw wrong") {
 			return
 		}
-		isAdmin, err := h.store.IsAdmin(userId)
+		if !h.requireRole(w, userId, storage.RoleMod) {
+			return
+		}
+		targetRole, err := h.store.GetRole(req.UserID)
 		if err != nil {
 			writeStoreError(w, err)
 			return
 		}
-		if !isAdmin {
-			writeError(w, http.StatusForbidden, "Only admins can set psws for others.")
+		if targetRole == storage.RoleAdmin {
+			writeError(w, http.StatusForbidden, "Only admins can act on admins.")
 			return
 		}
 	}
@@ -514,10 +955,19 @@ func (h *Handler) handleChatSend(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusForbidden, "senderId must be the same with header X-User-Id")
 		return
 	}
+	// 已被封禁的账号直接拒绝（403），提示比“非成员”更明确
+	if !h.rejectBannedAccount(w, req.SenderID) {
+		return
+	}
 	// 发送者必须是正式成员
 	if !h.requireMember(w, req.SenderID) {
 		return
 	}
+	// 已被封禁的来源 IP 直接拒绝（403）；正常请求则记录最近来源 IP 供 banip 使用
+	if !h.rejectBannedIP(w, r) {
+		return
+	}
+	h.noteLastIP(r, operator)
 	if req.Ciphertext == "" {
 		writeError(w, http.StatusBadRequest, "ciphertext cannot be blank")
 		return
@@ -539,6 +989,14 @@ func (h *Handler) handleChatMessages(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if !h.requireMember(w, operator) {
+		return
+	}
+	// 已被封禁的账号直接拒绝（403）
+	if !h.rejectBannedAccount(w, operator) {
+		return
+	}
+	// 已被封禁的来源 IP 直接拒绝（403）
+	if !h.rejectBannedIP(w, r) {
 		return
 	}
 	// date 参数（可选，默认当天）
@@ -588,6 +1046,14 @@ func (h *Handler) handleFileUploadCommon(w http.ResponseWriter, r *http.Request,
 	}
 	// 只有正式成员才能上传
 	if !h.requireMember(w, operator) {
+		return
+	}
+	// 已被封禁的账号直接拒绝（403）
+	if !h.rejectBannedAccount(w, operator) {
+		return
+	}
+	// 已被封禁的来源 IP 直接拒绝（403）
+	if !h.rejectBannedIP(w, r) {
 		return
 	}
 
@@ -658,6 +1124,14 @@ func (h *Handler) handleFileDownload(w http.ResponseWriter, r *http.Request) {
 	}
 	// 只有正式成员才能下载
 	if !h.requireMember(w, operator) {
+		return
+	}
+	// 已被封禁的账号直接拒绝（403）
+	if !h.rejectBannedAccount(w, operator) {
+		return
+	}
+	// 已被封禁的来源 IP 直接拒绝（403）
+	if !h.rejectBannedIP(w, r) {
 		return
 	}
 	path := r.URL.Query().Get("path")

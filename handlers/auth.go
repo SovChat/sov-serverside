@@ -148,7 +148,7 @@ func (h *Handler) authPayload(userId, token string, expiresAt time.Time) (map[st
 		// 兼容「-admin 启动」建立、尚未登记到账号表的账号
 		acc = storage.AccountInfo{UserID: userId, DisplayName: userId}
 	}
-	isAdmin, err := h.store.IsAdmin(userId)
+	role, err := h.store.GetRole(userId)
 	if err != nil {
 		return nil, err
 	}
@@ -163,7 +163,9 @@ func (h *Handler) authPayload(userId, token string, expiresAt time.Time) (map[st
 	payload := map[string]any{
 		"success":  true,
 		"user":     acc,
-		"isAdmin":  isAdmin,
+		"role":     role,
+		"isAdmin":  role == storage.RoleAdmin,
+		"isMod":    role == storage.RoleMod,
 		"isMember": isMember,
 		"group":    health,
 	}
@@ -192,6 +194,10 @@ func (h *Handler) handleAuthRegister(w http.ResponseWriter, r *http.Request) {
 	if !decodeJSONBody(w, r, &req) {
 		return
 	}
+	// 已被封禁的来源 IP 直接拒绝（403）
+	if !h.rejectBannedIP(w, r) {
+		return
+	}
 	req.UserID = strings.TrimSpace(req.UserID)
 	req.DisplayName = strings.TrimSpace(req.DisplayName)
 	if req.UserID == "" {
@@ -216,6 +222,8 @@ func (h *Handler) handleAuthRegister(w http.ResponseWriter, r *http.Request) {
 		writeStoreError(w, err)
 		return
 	}
+	// 注册成功：记录最近来源 IP（供后续 banip 使用）
+	h.noteLastIP(r, acc.UserID)
 	// 注册成功即登录：直接建立会话，前端无需再发一次登录请求
 	token, expiresAt, err := h.sessions.create(acc.UserID)
 	if err != nil {
@@ -251,6 +259,10 @@ func (h *Handler) handleAuthLogin(w http.ResponseWriter, r *http.Request) {
 	if !decodeJSONBody(w, r, &req) {
 		return
 	}
+	// 已被封禁的来源 IP 直接拒绝（403）
+	if !h.rejectBannedIP(w, r) {
+		return
+	}
 	req.UserID = strings.TrimSpace(req.UserID)
 	if req.UserID == "" {
 		writeError(w, http.StatusBadRequest, "userId cannot be blank")
@@ -276,6 +288,8 @@ func (h *Handler) handleAuthLogin(w http.ResponseWriter, r *http.Request) {
 	if !h.verifyOperator(w, req.UserID, req.Password, authFailedMsg) {
 		return
 	}
+	// 登录成功：记录最近来源 IP（供后续 banip 使用）
+	h.noteLastIP(r, req.UserID)
 	token, expiresAt, err := h.sessions.create(req.UserID)
 	if err != nil {
 		writeStoreError(w, err)
